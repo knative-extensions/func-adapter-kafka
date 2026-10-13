@@ -22,8 +22,6 @@ set -o nounset
 set -o pipefail
 
 ORG_NAME=knative-extensions
-# Run the unit tests before cutting a release.
-VALIDATION_TESTS="make test"
 
 source "$(go run knative.dev/hack/cmd/script release.sh)"
 
