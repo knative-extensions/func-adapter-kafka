@@ -168,10 +168,17 @@ func TestStart_ServesLivenessBeforeTargetReady(t *testing.T) {
 	t.Setenv("LISTEN_ADDRESS", "127.0.0.1:0")
 
 	svc := newService(stubAdapter{})
-	// Port 1 refuses connections, so waitForTarget keeps retrying and Start stays
-	// in the target-wait phase for the duration of the test (the consumer never
-	// starts).
-	svc.target = "http://127.0.0.1:1"
+	// Reserve an ephemeral port and immediately release it, then point the target
+	// at it: connections are reliably refused (no reliance on a well-known or
+	// possibly-privileged port), so waitForTarget keeps retrying and Start stays in
+	// the target-wait phase for the duration of the test (the consumer never starts).
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve a refused port: %v", err)
+	}
+	refusedTarget := "http://" + probe.Addr().String()
+	probe.Close()
+	svc.target = refusedTarget
 	svc.targetWaitTimeout = 10 * time.Second
 
 	ctx, cancel := context.WithCancel(context.Background())

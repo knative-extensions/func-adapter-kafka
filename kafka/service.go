@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -46,6 +47,10 @@ const (
 // alongside for health probes only (it does not receive events).
 type Service struct {
 	http.Server
+	// listenerMu guards listener: Start assigns it from its own goroutine while
+	// Addr may be read concurrently (e.g. a caller discovering the bound address
+	// after Start begins).
+	listenerMu    sync.Mutex
 	listener      net.Listener
 	adapter       KafkaAdapter
 	stop          chan error
@@ -107,9 +112,11 @@ func (s *Service) Start(ctx context.Context) (err error) {
 	addr := listenAddress()
 	log.Debug().Str("address", addr).Msg("kafka runtime starting")
 
-	if s.listener, err = net.Listen("tcp", addr); err != nil {
-		return
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
 	}
+	s.setListener(listener)
 
 	s.handleSignals()
 
@@ -120,7 +127,7 @@ func (s *Service) Start(ctx context.Context) (err error) {
 	// liveness probe saw connection-refused during the wait and the kubelet could
 	// restart-loop a slow-starting (e.g. JVM) function before it was ever up.
 	go func() {
-		if err := s.Serve(s.listener); err != http.ErrServerClosed {
+		if err := s.Serve(listener); err != http.ErrServerClosed {
 			log.Error().Err(err).Msg("health server exited with unexpected error")
 			s.sendStop(err)
 		}
@@ -138,6 +145,14 @@ func (s *Service) Start(ctx context.Context) (err error) {
 	case err = <-targetErr:
 		cancelWait()
 		if err != nil {
+			// If Start's own context was canceled, waitForTarget returns ctx.Err()
+			// here just as the ctx.Done() case below would fire -- the two race. Treat
+			// a cancellation the same way regardless of which select case wins, so the
+			// return value is deterministic (a clean shutdown, not a runtime failure).
+			if ctx.Err() != nil {
+				log.Debug().Msg("runtime canceled")
+				return s.shutdown(nil)
+			}
 			return s.shutdown(err)
 		}
 	case err = <-s.stop:
@@ -177,8 +192,17 @@ func (s *Service) Start(ctx context.Context) (err error) {
 	return s.shutdown(err)
 }
 
-// Addr returns the address upon which the health server is listening.
+func (s *Service) setListener(l net.Listener) {
+	s.listenerMu.Lock()
+	s.listener = l
+	s.listenerMu.Unlock()
+}
+
+// Addr returns the address upon which the health server is listening, or nil if
+// it has not started listening yet.
 func (s *Service) Addr() net.Addr {
+	s.listenerMu.Lock()
+	defer s.listenerMu.Unlock()
 	if s.listener == nil {
 		return nil
 	}
