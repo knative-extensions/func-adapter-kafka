@@ -17,8 +17,11 @@ limitations under the License.
 package kafka
 
 import (
+	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -126,5 +129,94 @@ func TestAlive_Default(t *testing.T) {
 	}
 	if w.Body.String() != "ALIVE" {
 		t.Errorf("expected body %q, got %q", "ALIVE", w.Body.String())
+	}
+}
+
+// TestWaitForTarget_RejectsInvalidTargets verifies the target is validated as an
+// absolute http(s) URL with a host before any dialing, so a misconfigured
+// FUNCTION_TARGET fails fast with a clear error instead of silently probing the
+// wrong address.
+func TestWaitForTarget_RejectsInvalidTargets(t *testing.T) {
+	cases := map[string]string{
+		"bare word":    "myfunc",
+		"host:port":    "127.0.0.1:8080",
+		"empty":        "",
+		"wrong scheme": "ftp://example.com",
+		"no host":      "http://",
+	}
+	for name, target := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := waitForTarget(context.Background(), target, time.Second)
+			if err == nil {
+				t.Fatalf("expected an error for target %q, got nil", target)
+			}
+			if !strings.Contains(err.Error(), "FUNCTION_TARGET") {
+				t.Errorf("expected error mentioning FUNCTION_TARGET, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestStart_ServesLivenessBeforeTargetReady is the regression test for the
+// restart-loop bug: the health server must report ALIVE while Start is still
+// waiting for a slow function target to accept connections. Previously the
+// server came up only after the target wait, so an injected liveness probe saw
+// connection-refused during a slow (e.g. JVM) cold start and the kubelet could
+// restart-loop the Pod before the function was ever up. Readiness stays 503
+// until the consumer has partitions assigned.
+func TestStart_ServesLivenessBeforeTargetReady(t *testing.T) {
+	t.Setenv("LISTEN_ADDRESS", "127.0.0.1:0")
+
+	svc := newService(stubAdapter{})
+	// Port 1 refuses connections, so waitForTarget keeps retrying and Start stays
+	// in the target-wait phase for the duration of the test (the consumer never
+	// starts).
+	svc.target = "http://127.0.0.1:1"
+	svc.targetWaitTimeout = 10 * time.Second
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- svc.Start(ctx) }()
+
+	// Wait for the health server to begin listening.
+	var addr net.Addr
+	for i := 0; i < 200; i++ {
+		if addr = svc.Addr(); addr != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if addr == nil {
+		cancel()
+		t.Fatal("health server did not start listening during the target wait")
+	}
+
+	base := "http://" + addr.String()
+
+	resp, err := http.Get(base + "/health/liveness")
+	if err != nil {
+		cancel()
+		t.Fatalf("GET liveness: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("liveness during target wait = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	rresp, err := http.Get(base + "/health/readiness")
+	if err != nil {
+		cancel()
+		t.Fatalf("GET readiness: %v", err)
+	}
+	rresp.Body.Close()
+	if rresp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("readiness during target wait = %d, want %d", rresp.StatusCode, http.StatusServiceUnavailable)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not return after context cancel")
 	}
 }

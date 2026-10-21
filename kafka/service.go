@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"sync/atomic"
@@ -33,6 +34,11 @@ import (
 const (
 	DefaultListenAddress  = "[::]:8080"
 	ServerShutdownTimeout = 30 * time.Second
+
+	// defaultTargetWaitTimeout bounds how long Start waits for the function target
+	// to accept connections before giving up (and letting the process exit so the
+	// kubelet restarts it). Sized for a slow cold start such as a JVM function.
+	defaultTargetWaitTimeout = 60 * time.Second
 )
 
 // Service consumes Kafka records and delivers each one as a binary-mode
@@ -45,6 +51,12 @@ type Service struct {
 	stop          chan error
 	ready         atomic.Bool
 	cancelConsume context.CancelFunc
+	// target is the function URL the runtime delivers to; Start waits for it to
+	// accept connections before it begins consuming.
+	target string
+	// targetWaitTimeout bounds the wait for target. Defaults to
+	// defaultTargetWaitTimeout; overridable in tests.
+	targetWaitTimeout time.Duration
 	// consumeDone is closed when the consumer goroutine has fully returned (and
 	// therefore its deferred client.Close() has committed final offsets and left
 	// the consumer group). shutdown waits on it so the process does not exit
@@ -63,14 +75,17 @@ func New(target string) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newService(adapter), nil
+	svc := newService(adapter)
+	svc.target = target
+	return svc, nil
 }
 
 func newService(adapter KafkaAdapter) *Service {
 	svc := &Service{
-		adapter:         adapter,
-		stop:            make(chan error, 1),
-		shutdownTimeout: ServerShutdownTimeout,
+		adapter:           adapter,
+		stop:              make(chan error, 1),
+		shutdownTimeout:   ServerShutdownTimeout,
+		targetWaitTimeout: defaultTargetWaitTimeout,
 		Server: http.Server{
 			ReadTimeout:       30 * time.Second,
 			WriteTimeout:      30 * time.Second,
@@ -98,12 +113,44 @@ func (s *Service) Start(ctx context.Context) (err error) {
 
 	s.handleSignals()
 
+	// Serve health immediately -- before waiting for the function target -- so the
+	// runtime reports liveness (ALIVE) throughout a slow function cold start.
+	// Readiness stays 503 until the consumer has partitions assigned. Previously
+	// the health server came up only after the target wait, so an injected
+	// liveness probe saw connection-refused during the wait and the kubelet could
+	// restart-loop a slow-starting (e.g. JVM) function before it was ever up.
 	go func() {
 		if err := s.Serve(s.listener); err != http.ErrServerClosed {
 			log.Error().Err(err).Msg("health server exited with unexpected error")
 			s.sendStop(err)
 		}
 	}()
+
+	// Wait for the function to accept connections before consuming, so the first
+	// records aren't needlessly redelivered while it starts up. A shutdown signal
+	// or a cancelled context aborts the wait; a timeout or invalid target returns
+	// an error so the process exits and the kubelet restarts it.
+	waitCtx, cancelWait := context.WithCancel(ctx)
+	targetErr := make(chan error, 1)
+	go func() { targetErr <- waitForTarget(waitCtx, s.target, s.targetWaitTimeout) }()
+
+	select {
+	case err = <-targetErr:
+		cancelWait()
+		if err != nil {
+			return s.shutdown(err)
+		}
+	case err = <-s.stop:
+		cancelWait()
+		if err != nil {
+			log.Error().Err(err).Msg("runtime error")
+		}
+		return s.shutdown(err)
+	case <-ctx.Done():
+		cancelWait()
+		log.Debug().Msg("runtime canceled")
+		return s.shutdown(nil)
+	}
 
 	consumerCtx, cancelConsume := context.WithCancel(ctx)
 	s.cancelConsume = cancelConsume
@@ -210,6 +257,53 @@ func listenAddress() string {
 		return v
 	}
 	return DefaultListenAddress
+}
+
+// waitForTarget blocks until a TCP connection to the function target succeeds,
+// the timeout elapses, or ctx is cancelled.
+func waitForTarget(ctx context.Context, target string, timeout time.Duration) error {
+	u, err := url.Parse(target)
+	if err != nil {
+		return fmt.Errorf("invalid FUNCTION_TARGET %q: %w", target, err)
+	}
+	// Require an absolute http(s) URL with a host. url.Parse accepts a bare word
+	// ("myfunc") as a relative URL with an empty host, which would otherwise
+	// silently resolve to probing ":80" on localhost instead of failing fast on a
+	// misconfiguration.
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("invalid FUNCTION_TARGET %q: must be an absolute http or https URL", target)
+	}
+	if u.Hostname() == "" {
+		return fmt.Errorf("invalid FUNCTION_TARGET %q: missing host", target)
+	}
+
+	host := u.Host
+	if u.Port() == "" {
+		port := "80"
+		if u.Scheme == "https" {
+			port = "443"
+		}
+		host = net.JoinHostPort(u.Hostname(), port)
+	}
+
+	deadline := time.Now().Add(timeout)
+	for {
+		conn, err := net.DialTimeout("tcp", host, 2*time.Second)
+		if err == nil {
+			_ = conn.Close()
+			log.Info().Str("target", target).Msg("function target is reachable; starting consumer")
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after %s waiting for function target %s: %w", timeout, target, err)
+		}
+		log.Info().Str("target", target).Msg("waiting for function target to become reachable")
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
 }
 
 func collapseErrors(msg string, ee ...error) (err error) {
