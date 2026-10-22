@@ -133,40 +133,6 @@ func (s *Service) Start(ctx context.Context) (err error) {
 		}
 	}()
 
-	// Wait for the function to accept connections before consuming, so the first
-	// records aren't needlessly redelivered while it starts up. A shutdown signal
-	// or a cancelled context aborts the wait; a timeout or invalid target returns
-	// an error so the process exits and the kubelet restarts it.
-	waitCtx, cancelWait := context.WithCancel(ctx)
-	targetErr := make(chan error, 1)
-	go func() { targetErr <- waitForTarget(waitCtx, s.target, s.targetWaitTimeout) }()
-
-	select {
-	case err = <-targetErr:
-		cancelWait()
-		if err != nil {
-			// If Start's own context was canceled, waitForTarget returns ctx.Err()
-			// here just as the ctx.Done() case below would fire -- the two race. Treat
-			// a cancellation the same way regardless of which select case wins, so the
-			// return value is deterministic (a clean shutdown, not a runtime failure).
-			if ctx.Err() != nil {
-				log.Debug().Msg("runtime canceled")
-				return s.shutdown(nil)
-			}
-			return s.shutdown(err)
-		}
-	case err = <-s.stop:
-		cancelWait()
-		if err != nil {
-			log.Error().Err(err).Msg("runtime error")
-		}
-		return s.shutdown(err)
-	case <-ctx.Done():
-		cancelWait()
-		log.Debug().Msg("runtime canceled")
-		return s.shutdown(nil)
-	}
-
 	consumerCtx, cancelConsume := context.WithCancel(ctx)
 	s.cancelConsume = cancelConsume
 	s.consumeDone = make(chan struct{})
@@ -174,6 +140,18 @@ func (s *Service) Start(ctx context.Context) (err error) {
 		// Close consumeDone last (after any sendStop) so a waiter in shutdown only
 		// unblocks once consume has fully returned and run its deferred cleanup.
 		defer close(s.consumeDone)
+
+		// Wait for the function to accept connections before consuming, so the first
+		// records aren't needlessly redelivered while it starts up. A timeout or an
+		// invalid target is a runtime failure -- stop so the process exits and the
+		// kubelet restarts it; a cancelled context is a clean shutdown, not an error.
+		if err := waitForTarget(consumerCtx, s.target, s.targetWaitTimeout); err != nil {
+			if consumerCtx.Err() == nil {
+				s.sendStop(err)
+			}
+			return
+		}
+
 		if err := consume(consumerCtx, s.adapter, &s.ready); err != nil {
 			log.Error().Err(err).Msg("kafka consumer exited with error")
 			s.sendStop(err)
