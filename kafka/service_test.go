@@ -18,6 +18,7 @@ package kafka
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -34,6 +35,34 @@ func newTestService(t *testing.T) *Service {
 		t.Fatalf("New: %v", err)
 	}
 	return svc
+}
+
+// refusedTarget reserves an ephemeral port and immediately releases it, returning
+// an http URL whose connections are reliably refused. This keeps waitForTarget in
+// its retry loop without relying on a well-known or possibly-privileged port.
+func refusedTarget(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve a refused port: %v", err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+	return "http://" + addr
+}
+
+// waitForHealthServer blocks until the service's health server is listening, so a
+// test can be sure Start is past Listen and into the target-wait phase.
+func waitForHealthServer(t *testing.T, svc *Service) net.Addr {
+	t.Helper()
+	for i := 0; i < 200; i++ {
+		if addr := svc.Addr(); addr != nil {
+			return addr
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("health server did not start listening")
+	return nil
 }
 
 func TestReady_NotReady(t *testing.T) {
@@ -168,39 +197,24 @@ func TestStart_ServesLivenessBeforeTargetReady(t *testing.T) {
 	t.Setenv("LISTEN_ADDRESS", "127.0.0.1:0")
 
 	svc := newService(stubAdapter{})
-	// Reserve an ephemeral port and immediately release it, then point the target
-	// at it: connections are reliably refused (no reliance on a well-known or
-	// possibly-privileged port), so waitForTarget keeps retrying and Start stays in
-	// the target-wait phase for the duration of the test (the consumer never starts).
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve a refused port: %v", err)
-	}
-	refusedTarget := "http://" + probe.Addr().String()
-	probe.Close()
-	svc.target = refusedTarget
+	// Point the target at a refused port so waitForTarget keeps retrying and Start
+	// stays in the target-wait phase for the duration of the test (the consumer
+	// never starts).
+	svc.target = refusedTarget(t)
 	svc.targetWaitTimeout = 10 * time.Second
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- svc.Start(ctx) }()
 
-	// Wait for the health server to begin listening.
-	var addr net.Addr
-	for i := 0; i < 200; i++ {
-		if addr = svc.Addr(); addr != nil {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if addr == nil {
-		cancel()
-		t.Fatal("health server did not start listening during the target wait")
-	}
-
+	addr := waitForHealthServer(t, svc)
 	base := "http://" + addr.String()
 
-	resp, err := http.Get(base + "/health/liveness")
+	// A bounded client so a regression (serving only after the target wait) fails
+	// fast here instead of hanging until the test binary's global timeout.
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	resp, err := client.Get(base + "/health/liveness")
 	if err != nil {
 		cancel()
 		t.Fatalf("GET liveness: %v", err)
@@ -210,7 +224,7 @@ func TestStart_ServesLivenessBeforeTargetReady(t *testing.T) {
 		t.Errorf("liveness during target wait = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
 
-	rresp, err := http.Get(base + "/health/readiness")
+	rresp, err := client.Get(base + "/health/readiness")
 	if err != nil {
 		cancel()
 		t.Fatalf("GET readiness: %v", err)
@@ -220,10 +234,134 @@ func TestStart_ServesLivenessBeforeTargetReady(t *testing.T) {
 		t.Errorf("readiness during target wait = %d, want %d", rresp.StatusCode, http.StatusServiceUnavailable)
 	}
 
+	// Cancelling during the wait is a clean shutdown: Start returns nil.
 	cancel()
 	select {
-	case <-done:
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Start after cancel during the wait = %v, want nil", err)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Start did not return after context cancel")
+	}
+}
+
+// TestWaitForTarget_SucceedsWhenListening verifies waitForTarget returns nil once
+// the target accepts a TCP connection.
+func TestWaitForTarget_SucceedsWhenListening(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer l.Close()
+
+	target := "http://" + l.Addr().String()
+	errc := make(chan error, 1)
+	go func() { errc <- waitForTarget(context.Background(), target, 2*time.Second) }()
+
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("waitForTarget on a listening target = %v, want nil", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("waitForTarget did not return for a reachable target")
+	}
+}
+
+// TestWaitForTarget_TimesOutWhenRefused verifies waitForTarget gives up with a
+// timeout error once the deadline passes against an unreachable target, instead
+// of retrying forever. Bounded so a missing deadline check fails the test rather
+// than hanging until the global test timeout.
+func TestWaitForTarget_TimesOutWhenRefused(t *testing.T) {
+	target := refusedTarget(t)
+	errc := make(chan error, 1)
+	go func() { errc <- waitForTarget(context.Background(), target, 100*time.Millisecond) }()
+
+	select {
+	case err := <-errc:
+		if err == nil {
+			t.Fatal("waitForTarget on a refused target = nil, want a timeout error")
+		}
+		if !strings.Contains(err.Error(), "timed out") {
+			t.Errorf("expected a timeout error, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("waitForTarget did not time out; deadline not enforced?")
+	}
+}
+
+// TestWaitForTarget_CancelDuringWait verifies a context cancellation during the
+// wait returns context.Canceled well before the timeout, so a shutdown aborts the
+// wait promptly.
+func TestWaitForTarget_CancelDuringWait(t *testing.T) {
+	target := refusedTarget(t)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	errc := make(chan error, 1)
+	go func() { errc <- waitForTarget(ctx, target, 10*time.Second) }()
+
+	// Let the first dial fail and the wait enter its retry sleep, then cancel.
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errc:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("waitForTarget after cancel = %v, want context.Canceled", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("waitForTarget did not return promptly after cancel")
+	}
+}
+
+// TestStart_ReturnsErrorOnTargetTimeout verifies Start returns a non-nil error
+// when the function target never becomes reachable within targetWaitTimeout, so
+// the process exits and the kubelet restarts it.
+func TestStart_ReturnsErrorOnTargetTimeout(t *testing.T) {
+	t.Setenv("LISTEN_ADDRESS", "127.0.0.1:0")
+
+	svc := newService(stubAdapter{})
+	svc.target = refusedTarget(t)
+	svc.targetWaitTimeout = 100 * time.Millisecond
+
+	done := make(chan error, 1)
+	go func() { done <- svc.Start(context.Background()) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Start returned nil on a target-wait timeout; want a non-nil error so the process exits")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Start did not return after the target wait timed out")
+	}
+}
+
+// TestStart_ReturnsNilOnStopDuringWait verifies the SIGTERM path: a clean stop
+// signalled while Start is still waiting for the target returns nil, joining the
+// wait goroutine through shutdown rather than treating the stop as a failure.
+func TestStart_ReturnsNilOnStopDuringWait(t *testing.T) {
+	t.Setenv("LISTEN_ADDRESS", "127.0.0.1:0")
+
+	svc := newService(stubAdapter{})
+	svc.target = refusedTarget(t)
+	svc.targetWaitTimeout = 10 * time.Second
+
+	done := make(chan error, 1)
+	go func() { done <- svc.Start(context.Background()) }()
+
+	// Once the health server is up, Start is in the target wait; signal a clean
+	// stop as the signal handler would on SIGTERM.
+	waitForHealthServer(t, svc)
+	svc.sendStop(nil)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Start after a clean stop during the wait = %v, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Start did not return after a clean stop during the wait")
 	}
 }
