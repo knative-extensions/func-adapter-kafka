@@ -288,21 +288,34 @@ func waitForTarget(ctx context.Context, target string, timeout time.Duration) er
 		host = net.JoinHostPort(u.Hostname(), port)
 	}
 
-	deadline := time.Now().Add(timeout)
+	// Bound the whole wait with a context so the configured timeout and any
+	// cancellation are honored promptly -- including mid-dial. A context-aware
+	// dialer (rather than net.DialTimeout with a fixed per-dial timeout) means a
+	// short timeout or a shutdown does not have to wait out a dial against a
+	// black-holed address.
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var dialer net.Dialer
 	for {
-		conn, err := net.DialTimeout("tcp", host, 2*time.Second)
+		conn, err := dialer.DialContext(dialCtx, "tcp", host)
 		if err == nil {
 			_ = conn.Close()
 			log.Info().Str("target", target).Msg("function target is reachable; starting consumer")
 			return nil
 		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out after %s waiting for function target %s: %w", timeout, target, err)
+		// Check the parent first: if it was cancelled, the child inherited the
+		// cancellation, but we want to report context.Canceled (a clean shutdown),
+		// not a timeout.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if dialCtx.Err() != nil {
+			return fmt.Errorf("timed out after %s waiting for function target %s", timeout, target)
 		}
 		log.Info().Str("target", target).Msg("waiting for function target to become reachable")
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-dialCtx.Done():
 		case <-time.After(time.Second):
 		}
 	}
