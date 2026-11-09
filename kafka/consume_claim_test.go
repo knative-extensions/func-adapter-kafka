@@ -18,6 +18,7 @@ package kafka
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -267,7 +268,7 @@ func TestConsumeClaim_PassesThroughCloudEventHeaders(t *testing.T) {
 // (43) is queued behind the failing one (42) specifically so a mutant that gives
 // up after N tries and advances would be caught: it would attempt 43 and/or mark.
 func TestConsumeClaim_DoesNotMarkOffsetOnFailure(t *testing.T) {
-	adapter := &capturingAdapter{err: rejectedErr(), called: make(chan struct{}, 16)}
+	adapter := &capturingAdapter{err: errors.New("delivery failed"), called: make(chan struct{}, 16)}
 	h := &consumerGroupHandler{adapter: adapter, brokers: "broker:9092", delivery: defaultDeliveryConfig()}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -327,7 +328,7 @@ type perOffsetAdapter struct {
 func (a *perOffsetAdapter) Invoke(_ context.Context, e event.Event) (*event.Event, error) {
 	a.calls.Add(1)
 	if e.ID() == a.failID {
-		return nil, rejectedErr()
+		return nil, errors.New("delivery failed")
 	}
 	return nil, nil
 }

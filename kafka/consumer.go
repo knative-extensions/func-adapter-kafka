@@ -19,7 +19,6 @@ package kafka
 import (
 	"context"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -224,9 +223,10 @@ const (
 	deliveredOK deliveryOutcome = iota
 	// deliveryExhausted: a finite retry budget was used up without an ack. The
 	// record is skipped and its offset committed (so the partition is not wedged);
-	// the record is dropped. Only record-attributable failures (non-2xx rejections
-	// and per-attempt timeouts) count toward this budget; a transport/dial error
-	// (unreachable function) does not (see deliver).
+	// the record is dropped (dead-letter routing is planned). Every delivery
+	// failure counts toward this budget -- a non-2xx rejection, a per-attempt
+	// timeout, and a transport/dial error (unreachable function) alike, matching
+	// Knative Eventing (see deliver).
 	deliveryExhausted
 	// deliveryAborted: the session context was cancelled (rebalance/shutdown)
 	// before a successful delivery. Do NOT commit, so the record is redelivered
@@ -236,24 +236,20 @@ const (
 
 // deliver invokes the function for a single record, retrying failed attempts per
 // the handler's deliveryConfig. It returns deliveredOK on a successful ack,
-// deliveryExhausted when a finite retry budget of rejections is used up, and
-// deliveryAborted when ctx is cancelled (rebalance/shutdown) before success.
+// deliveryExhausted when a finite retry budget is used up, and deliveryAborted
+// when ctx is cancelled (rebalance/shutdown) before success.
 //
-// The finite retry budget is spent only on failures attributable to the record --
-// a non-2xx rejection (the function received it and said no) or a per-attempt
-// timeout (the function received it and hung). A transport/dial error means the
-// function was unreachable (a restart or crash), not that the record is bad, so it
-// is retried indefinitely and never exhausts the budget. This keeps at-least-once
-// intact across an outage longer than the budget, while still letting a bounded
-// budget skip a genuinely unprocessable record so it cannot wedge the partition
-// forever.
+// Every delivery failure -- a non-2xx rejection, a per-attempt timeout, or a
+// transport/dial error (the function was unreachable) -- counts toward the finite
+// retry budget, matching Knative Eventing's delivery semantics. With the default
+// unlimited budget nothing is ever exhausted, so a failing record blocks its
+// partition until the function recovers (at-least-once; nothing is dropped). With a
+// finite budget, an exhausted record is skipped so a poison-pill cannot wedge the
+// partition forever; today the record is dropped, and dead-letter routing (sending
+// it elsewhere instead of dropping) is planned -- at which point only the terminal
+// action changes, not what counts toward the budget.
 func (h *consumerGroupHandler) deliver(ctx context.Context, msg *sarama.ConsumerMessage, e event.Event) deliveryOutcome {
 	cfg := h.delivery
-	// spent counts only record-attributable failures (rejection or timeout) -- the
-	// attempts the finite budget actually pays for. A separate counter (rather than
-	// the total attempt index) ensures retries spent waiting out an unreachable
-	// function do not consume the budget.
-	spent := 0
 	for attempt := 1; ; attempt++ {
 		_, err := h.adapter.Invoke(ctx, e)
 		if err == nil {
@@ -272,24 +268,16 @@ func (h *consumerGroupHandler) deliver(ctx context.Context, msg *sarama.Consumer
 			return deliveryAborted
 		}
 
-		// A non-2xx rejection or a per-attempt timeout is attributable to the
-		// record, so it spends the budget. A transport/dial error (unreachable
-		// function) does not: it is retried indefinitely so an outage cannot drop
-		// good records.
-		recordAttributable := errors.Is(err, errFunctionRejected) || errors.Is(err, errDeliveryTimeout)
-		if recordAttributable {
-			spent++
-		}
-
-		// Stop once a finite budget is exhausted. A loud warning makes the dropped
-		// record visible; an observability metric is tracked separately (the
-		// runtime has no metrics subsystem yet).
-		if recordAttributable && !cfg.unlimited() && spent >= cfg.maxAttempts() {
+		// Stop once a finite budget is exhausted. Every failure counts toward it
+		// (see the doc comment). A loud warning makes the dropped record visible;
+		// an observability metric is tracked separately (the runtime has no metrics
+		// subsystem yet).
+		if !cfg.unlimited() && attempt >= cfg.maxAttempts() {
 			log.Warn().Err(err).
 				Str("topic", msg.Topic).
 				Int32("partition", msg.Partition).
 				Int64("offset", msg.Offset).
-				Int("budgetSpent", spent).
+				Int("attempts", attempt).
 				Int("maxAttempts", cfg.maxAttempts()).
 				Msg("delivery to function failed and the retry budget is exhausted; skipping record and committing offset (record dropped)")
 			return deliveryExhausted
@@ -301,7 +289,6 @@ func (h *consumerGroupHandler) deliver(ctx context.Context, msg *sarama.Consumer
 			Int32("partition", msg.Partition).
 			Int64("offset", msg.Offset).
 			Int("attempt", attempt).
-			Bool("budgeted", recordAttributable).
 			Dur("retryIn", backoff).
 			Msg("delivery to function failed; will retry")
 

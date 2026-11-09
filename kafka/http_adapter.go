@@ -18,7 +18,6 @@ package kafka
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	nethttp "net/http"
 	"strconv"
@@ -146,26 +145,6 @@ func maxConcurrency() (int, error) {
 	return n, nil
 }
 
-// errFunctionRejected and errDeliveryTimeout mark the two delivery failures that
-// are attributable to the record itself rather than to the function being
-// unreachable:
-//
-//   - errFunctionRejected: the function received the record and returned a non-2xx
-//     status -- it actively rejected this specific record ("poison").
-//   - errDeliveryTimeout: the function received the request but did not respond
-//     within the per-attempt timeout -- it is unresponsive while processing this
-//     record (e.g. the handler hangs on this payload).
-//
-// Both are distinct from a transport/dial error, where the function was simply
-// unreachable (a restart, crash or scale-up) and the record is perfectly
-// deliverable once it recovers. The consumer's retry loop spends a finite retry
-// budget only on these two -- not on an unreachable function -- so an outage does
-// not burn the budget and drop good records. Match them with errors.Is.
-var (
-	errFunctionRejected = errors.New("function returned non-2xx status")
-	errDeliveryTimeout  = errors.New("function did not respond within the per-attempt timeout")
-)
-
 func (a *httpAdapter) Invoke(ctx context.Context, e event.Event) (*event.Event, error) {
 	// Bound concurrent deliveries (defense-in-depth). Respect cancellation while
 	// waiting for a slot so a rebalance/shutdown does not block here.
@@ -199,17 +178,14 @@ func (a *httpAdapter) Invoke(ctx context.Context, e event.Event) (*event.Event, 
 		if httpResult.StatusCode >= 200 && httpResult.StatusCode < 300 {
 			return resp, nil
 		}
-		return nil, fmt.Errorf("%w %d: %w", errFunctionRejected, httpResult.StatusCode, result)
+		return nil, fmt.Errorf("function returned non-2xx status %d: %w", httpResult.StatusCode, result)
 	}
 
-	// No HTTP status: the request did not complete. Distinguish a per-attempt
-	// timeout (our deadline fired while the session context is still live -- the
-	// function received the request but did not respond, so the failure points at
-	// this record) from a transport/dial error (the function was unreachable). A
-	// session-context cancellation is handled by the caller, which checks ctx.Err()
-	// before classifying, so it never reaches the budget here.
-	if a.timeout > 0 && reqCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
-		return nil, fmt.Errorf("%w (%s): %w", errDeliveryTimeout, a.timeout, result)
-	}
+	// No HTTP status means the request did not complete: a transport/dial error
+	// (the function was unreachable) or a per-attempt timeout. Every such failure
+	// is a failed delivery that the consumer retries and counts toward a finite
+	// retry budget, exactly like a non-2xx response -- matching Knative Eventing's
+	// delivery semantics. The consumer distinguishes a session-context
+	// cancellation (rebalance/shutdown) via ctx.Err() before it reaches the budget.
 	return nil, fmt.Errorf("delivering event to %s failed: %w", a.target, result)
 }
