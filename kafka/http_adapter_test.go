@@ -113,9 +113,12 @@ func TestHTTPAdapter_TimeoutFails(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Errorf("Invoke took %v; the per-delivery timeout did not fire", elapsed)
 	}
-	// A timeout means the function was unresponsive, not that it rejected the
-	// record: it must NOT classify as errFunctionRejected, so the consumer retries
-	// it without spending the finite budget.
+	// A timeout is record-attributable (the function received the request but hung
+	// on it), so it must classify as errDeliveryTimeout -- the consumer spends the
+	// finite budget on it -- but not as a non-2xx rejection.
+	if !errors.Is(err, errDeliveryTimeout) {
+		t.Errorf("timeout error does not classify as errDeliveryTimeout: %v", err)
+	}
 	if errors.Is(err, errFunctionRejected) {
 		t.Errorf("timeout error wrongly classifies as errFunctionRejected: %v", err)
 	}
@@ -177,12 +180,15 @@ func TestHTTPAdapter_ConnectionErrorRetries(t *testing.T) {
 	if err == nil {
 		t.Fatal("Invoke returned nil on connection failure; want error")
 	}
-	// A transport/connection error means the function was unreachable, not that it
-	// rejected the record: it must NOT classify as errFunctionRejected, so the
-	// consumer retries it without spending the finite budget (an outage must not
-	// drop good records).
+	// A transport/connection error means the function was unreachable, not that the
+	// failure is attributable to the record: it must classify as neither
+	// errFunctionRejected nor errDeliveryTimeout, so the consumer retries it without
+	// spending the finite budget (an outage must not drop good records).
 	if errors.Is(err, errFunctionRejected) {
 		t.Errorf("connection error wrongly classifies as errFunctionRejected: %v", err)
+	}
+	if errors.Is(err, errDeliveryTimeout) {
+		t.Errorf("connection error wrongly classifies as errDeliveryTimeout: %v", err)
 	}
 }
 

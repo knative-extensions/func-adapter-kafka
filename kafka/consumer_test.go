@@ -489,8 +489,8 @@ type flakyAdapter struct {
 	alwaysFail   bool
 	// failErr is the error returned for a failed attempt. When nil it defaults to
 	// a transport-style failure (the function was unreachable), which does NOT
-	// spend the finite retry budget. Set it to rejectedErr() to model a non-2xx
-	// rejection (poison), which does.
+	// spend the finite retry budget. Set it to rejectedErr() or timeoutErr() to
+	// model a record-attributable failure, which does.
 	failErr error
 	calls   int
 }
@@ -508,11 +508,16 @@ func (f *flakyAdapter) Invoke(context.Context, event.Event) (*event.Event, error
 }
 
 // rejectedErr returns an error that classifies as a non-2xx rejection ("poison"),
-// as httpAdapter.Invoke produces for a non-2xx response. deliver spends the finite
-// retry budget only on such errors; a plain error models an unreachable function
-// (transport error/timeout) that is retried without spending the budget.
+// and timeoutErr one that classifies as a per-attempt timeout -- the two
+// record-attributable failures httpAdapter.Invoke produces. deliver spends the
+// finite retry budget on both; a plain error models an unreachable function
+// (transport/dial error) that is retried without spending the budget.
 func rejectedErr() error {
 	return fmt.Errorf("function returned non-2xx status 500: %w", errFunctionRejected)
+}
+
+func timeoutErr() error {
+	return fmt.Errorf("function did not respond in time: %w", errDeliveryTimeout)
 }
 
 // fastUnlimitedDelivery is the default (unlimited retries) with a tiny backoff so
@@ -571,6 +576,26 @@ func TestDeliver_StopsOnContextCancel(t *testing.T) {
 // wedging the partition.
 func TestDeliver_ExhaustsFiniteRetryBudget(t *testing.T) {
 	fake := &flakyAdapter{alwaysFail: true, failErr: rejectedErr()}
+	cfg := fastUnlimitedDelivery()
+	cfg.retry = 2 // 3 total attempts
+	h := &consumerGroupHandler{adapter: fake, delivery: cfg}
+	msg := &sarama.ConsumerMessage{Topic: "t", Partition: 0, Offset: 1}
+
+	if out := h.deliver(context.Background(), msg, event.New()); out != deliveryExhausted {
+		t.Fatalf("deliver returned %v; want deliveryExhausted", out)
+	}
+	if fake.calls != 3 {
+		t.Errorf("Invoke called %d times, want 3 (retry=2 → 3 total attempts)", fake.calls)
+	}
+}
+
+// A per-attempt timeout is record-attributable (the function received the request
+// but hung on it), so it spends the finite budget just like a rejection: after
+// retry+1 timeouts deliver exhausts and the caller skips the record. Without this,
+// a record that reliably hangs the handler would wedge the partition forever even
+// with a bounded budget.
+func TestDeliver_TimeoutExhaustsFiniteRetryBudget(t *testing.T) {
+	fake := &flakyAdapter{alwaysFail: true, failErr: timeoutErr()}
 	cfg := fastUnlimitedDelivery()
 	cfg.retry = 2 // 3 total attempts
 	h := &consumerGroupHandler{adapter: fake, delivery: cfg}

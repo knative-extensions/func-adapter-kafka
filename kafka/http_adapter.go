@@ -146,15 +146,25 @@ func maxConcurrency() (int, error) {
 	return n, nil
 }
 
-// errFunctionRejected marks a delivery failure where the function received the
-// record and returned a non-2xx status -- it actively rejected this specific
-// record ("poison"). It is deliberately distinct from a transport error or
-// timeout, where the function was unreachable or unresponsive and the record
-// itself may be perfectly deliverable once the function recovers. The consumer's
-// retry loop spends a finite retry budget only on rejection, so a function
-// outage (restart, crash, overload) does not burn the budget and drop good
-// records. Match it with errors.Is.
-var errFunctionRejected = errors.New("function returned non-2xx status")
+// errFunctionRejected and errDeliveryTimeout mark the two delivery failures that
+// are attributable to the record itself rather than to the function being
+// unreachable:
+//
+//   - errFunctionRejected: the function received the record and returned a non-2xx
+//     status -- it actively rejected this specific record ("poison").
+//   - errDeliveryTimeout: the function received the request but did not respond
+//     within the per-attempt timeout -- it is unresponsive while processing this
+//     record (e.g. the handler hangs on this payload).
+//
+// Both are distinct from a transport/dial error, where the function was simply
+// unreachable (a restart, crash or scale-up) and the record is perfectly
+// deliverable once it recovers. The consumer's retry loop spends a finite retry
+// budget only on these two -- not on an unreachable function -- so an outage does
+// not burn the budget and drop good records. Match them with errors.Is.
+var (
+	errFunctionRejected = errors.New("function returned non-2xx status")
+	errDeliveryTimeout  = errors.New("function did not respond within the per-attempt timeout")
+)
 
 func (a *httpAdapter) Invoke(ctx context.Context, e event.Event) (*event.Event, error) {
 	// Bound concurrent deliveries (defense-in-depth). Respect cancellation while
@@ -168,15 +178,18 @@ func (a *httpAdapter) Invoke(ctx context.Context, e event.Event) (*event.Event, 
 		}
 	}
 
+	// reqCtx carries the per-attempt timeout; keep ctx (the session context) so a
+	// timeout can be told apart from a shutdown/rebalance cancellation below.
+	reqCtx := ctx
 	if a.timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, a.timeout)
+		reqCtx, cancel = context.WithTimeout(ctx, a.timeout)
 		defer cancel()
 	}
-	ctx = cloudevents.ContextWithTarget(ctx, a.target)
-	ctx = cloudevents.WithEncodingBinary(ctx)
+	reqCtx = cloudevents.ContextWithTarget(reqCtx, a.target)
+	reqCtx = cloudevents.WithEncodingBinary(reqCtx)
 
-	resp, result := a.client.Request(ctx, e)
+	resp, result := a.client.Request(reqCtx, e)
 
 	// The commit ack is a 2xx HTTP status. Check the status explicitly rather
 	// than relying on IsACK, which treats a delivered-but-rejected response
@@ -189,7 +202,14 @@ func (a *httpAdapter) Invoke(ctx context.Context, e event.Event) (*event.Event, 
 		return nil, fmt.Errorf("%w %d: %w", errFunctionRejected, httpResult.StatusCode, result)
 	}
 
-	// No HTTP status available means the request never completed (transport
-	// error, timeout): treat as a failure so the record is redelivered.
+	// No HTTP status: the request did not complete. Distinguish a per-attempt
+	// timeout (our deadline fired while the session context is still live -- the
+	// function received the request but did not respond, so the failure points at
+	// this record) from a transport/dial error (the function was unreachable). A
+	// session-context cancellation is handled by the caller, which checks ctx.Err()
+	// before classifying, so it never reaches the budget here.
+	if a.timeout > 0 && reqCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+		return nil, fmt.Errorf("%w (%s): %w", errDeliveryTimeout, a.timeout, result)
+	}
 	return nil, fmt.Errorf("delivering event to %s failed: %w", a.target, result)
 }
