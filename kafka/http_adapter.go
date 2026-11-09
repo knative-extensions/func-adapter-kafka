@@ -18,6 +18,7 @@ package kafka
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	nethttp "net/http"
 	"strconv"
@@ -145,6 +146,16 @@ func maxConcurrency() (int, error) {
 	return n, nil
 }
 
+// errFunctionRejected marks a delivery failure where the function received the
+// record and returned a non-2xx status -- it actively rejected this specific
+// record ("poison"). It is deliberately distinct from a transport error or
+// timeout, where the function was unreachable or unresponsive and the record
+// itself may be perfectly deliverable once the function recovers. The consumer's
+// retry loop spends a finite retry budget only on rejection, so a function
+// outage (restart, crash, overload) does not burn the budget and drop good
+// records. Match it with errors.Is.
+var errFunctionRejected = errors.New("function returned non-2xx status")
+
 func (a *httpAdapter) Invoke(ctx context.Context, e event.Event) (*event.Event, error) {
 	// Bound concurrent deliveries (defense-in-depth). Respect cancellation while
 	// waiting for a slot so a rebalance/shutdown does not block here.
@@ -175,7 +186,7 @@ func (a *httpAdapter) Invoke(ctx context.Context, e event.Event) (*event.Event, 
 		if httpResult.StatusCode >= 200 && httpResult.StatusCode < 300 {
 			return resp, nil
 		}
-		return nil, fmt.Errorf("function returned non-2xx status %d: %w", httpResult.StatusCode, result)
+		return nil, fmt.Errorf("%w %d: %w", errFunctionRejected, httpResult.StatusCode, result)
 	}
 
 	// No HTTP status available means the request never completed (transport

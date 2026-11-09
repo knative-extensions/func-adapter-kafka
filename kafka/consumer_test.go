@@ -487,16 +487,32 @@ func (stubAdapter) Invoke(context.Context, event.Event) (*event.Event, error) {
 type flakyAdapter struct {
 	failuresLeft int
 	alwaysFail   bool
-	calls        int
+	// failErr is the error returned for a failed attempt. When nil it defaults to
+	// a transport-style failure (the function was unreachable), which does NOT
+	// spend the finite retry budget. Set it to rejectedErr() to model a non-2xx
+	// rejection (poison), which does.
+	failErr error
+	calls   int
 }
 
 func (f *flakyAdapter) Invoke(context.Context, event.Event) (*event.Event, error) {
 	f.calls++
 	if f.alwaysFail || f.failuresLeft > 0 {
 		f.failuresLeft--
+		if f.failErr != nil {
+			return nil, f.failErr
+		}
 		return nil, errors.New("transient delivery failure")
 	}
 	return nil, nil
+}
+
+// rejectedErr returns an error that classifies as a non-2xx rejection ("poison"),
+// as httpAdapter.Invoke produces for a non-2xx response. deliver spends the finite
+// retry budget only on such errors; a plain error models an unreachable function
+// (transport error/timeout) that is retried without spending the budget.
+func rejectedErr() error {
+	return fmt.Errorf("function returned non-2xx status 500: %w", errFunctionRejected)
 }
 
 // fastUnlimitedDelivery is the default (unlimited retries) with a tiny backoff so
@@ -549,11 +565,12 @@ func TestDeliver_StopsOnContextCancel(t *testing.T) {
 	}
 }
 
-// With a finite retry budget and a function that always fails, deliver stops
-// after retry+1 total attempts and reports deliveryExhausted so the caller
-// commits the offset (skip-and-commit) instead of wedging the partition.
+// With a finite retry budget and a function that always REJECTS the record
+// (non-2xx), deliver stops after retry+1 total rejections and reports
+// deliveryExhausted so the caller commits the offset (skip-and-commit) instead of
+// wedging the partition.
 func TestDeliver_ExhaustsFiniteRetryBudget(t *testing.T) {
-	fake := &flakyAdapter{alwaysFail: true}
+	fake := &flakyAdapter{alwaysFail: true, failErr: rejectedErr()}
 	cfg := fastUnlimitedDelivery()
 	cfg.retry = 2 // 3 total attempts
 	h := &consumerGroupHandler{adapter: fake, delivery: cfg}
@@ -567,9 +584,9 @@ func TestDeliver_ExhaustsFiniteRetryBudget(t *testing.T) {
 	}
 }
 
-// retry=0 means a single attempt with no retry: a failure exhausts immediately.
+// retry=0 means a single attempt with no retry: one rejection exhausts immediately.
 func TestDeliver_ZeroRetriesIsSingleAttempt(t *testing.T) {
-	fake := &flakyAdapter{alwaysFail: true}
+	fake := &flakyAdapter{alwaysFail: true, failErr: rejectedErr()}
 	cfg := fastUnlimitedDelivery()
 	cfg.retry = 0
 	h := &consumerGroupHandler{adapter: fake, delivery: cfg}
@@ -581,6 +598,89 @@ func TestDeliver_ZeroRetriesIsSingleAttempt(t *testing.T) {
 	if fake.calls != 1 {
 		t.Errorf("Invoke called %d times, want 1 (retry=0 → single attempt)", fake.calls)
 	}
+}
+
+// A function that is UNREACHABLE (transport error/timeout, not a non-2xx) must NOT
+// spend the finite retry budget: an outage longer than the budget would otherwise
+// drop good records and break at-least-once. deliver keeps retrying past
+// retry+1 total attempts and only stops when the session is cancelled
+// (deliveryAborted), so the record is redelivered rather than committed-and-dropped.
+func TestDeliver_UnreachableDoesNotExhaustFiniteBudget(t *testing.T) {
+	// capturingAdapter (atomic counter + a non-blocking "called" signal) lets the
+	// test observe attempts from another goroutine without racing deliver's own
+	// Invoke calls. A plain transport-style error models an unreachable function.
+	adapter := &capturingAdapter{err: errors.New("connection refused"), called: make(chan struct{}, 16)}
+	cfg := fastUnlimitedDelivery()
+	cfg.retry = 2 // a finite budget that unreachable errors must not consume
+	h := &consumerGroupHandler{adapter: adapter, delivery: cfg}
+	msg := &sarama.ConsumerMessage{Topic: "t", Partition: 0, Offset: 1}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan deliveryOutcome, 1)
+	go func() { done <- h.deliver(ctx, msg, event.New()) }()
+
+	// Wait for 6 attempts -- well past the finite budget (retry+1 = 3). If the
+	// budget were wrongly spent on unreachable errors, deliver would have returned
+	// deliveryExhausted instead of still retrying.
+	for i := 0; i < 6; i++ {
+		select {
+		case <-adapter.called:
+		case out := <-done:
+			cancel()
+			t.Fatalf("deliver returned %v before cancel; an unreachable function must not exhaust a finite budget", out)
+		case <-time.After(5 * time.Second):
+			cancel()
+			t.Fatalf("deliver retried only %d times; expected it to keep retrying past the finite budget", adapter.calls.Load())
+		}
+	}
+
+	cancel()
+	select {
+	case out := <-done:
+		if out != deliveryAborted {
+			t.Fatalf("deliver returned %v; want deliveryAborted (unreachable record must be redelivered, not dropped)", out)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("deliver did not return after context cancellation")
+	}
+}
+
+// The finite budget counts only rejections, so attempts spent waiting out an
+// unreachable function do not shrink the budget available for genuine poison
+// rejections. Here the function is unreachable for the first few attempts, then
+// rejects every record; deliver must still allow retry+1 rejections before
+// exhausting.
+func TestDeliver_BudgetCountsRejectionsNotUnreachable(t *testing.T) {
+	// unreachableThenReject fails the first `unreachable` attempts with a
+	// transport-style error, then rejects (non-2xx) every attempt thereafter.
+	fake := &unreachableThenReject{unreachable: 3}
+	cfg := fastUnlimitedDelivery()
+	cfg.retry = 2 // 3 rejections allowed before exhaustion
+	h := &consumerGroupHandler{adapter: fake, delivery: cfg}
+	msg := &sarama.ConsumerMessage{Topic: "t", Partition: 0, Offset: 1}
+
+	if out := h.deliver(context.Background(), msg, event.New()); out != deliveryExhausted {
+		t.Fatalf("deliver returned %v; want deliveryExhausted", out)
+	}
+	// 3 unreachable attempts (not counted) + 3 rejections (retry+1) = 6 total.
+	if fake.calls != 6 {
+		t.Errorf("Invoke called %d times, want 6 (3 unreachable + 3 rejections)", fake.calls)
+	}
+}
+
+// unreachableThenReject returns a transport-style failure for its first
+// `unreachable` invocations, then a non-2xx rejection for every attempt after.
+type unreachableThenReject struct {
+	unreachable int
+	calls       int
+}
+
+func (f *unreachableThenReject) Invoke(context.Context, event.Event) (*event.Event, error) {
+	f.calls++
+	if f.calls <= f.unreachable {
+		return nil, errors.New("connection refused")
+	}
+	return nil, rejectedErr()
 }
 
 // A cancelled context (rebalance/shutdown) landing on a failing attempt must be

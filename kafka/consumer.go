@@ -19,6 +19,7 @@ package kafka
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -221,9 +222,10 @@ type deliveryOutcome int
 const (
 	// deliveredOK: the function acknowledged the record (2xx). Commit the offset.
 	deliveredOK deliveryOutcome = iota
-	// deliveryExhausted: a finite retry budget was used up without an ack. The
-	// record is skipped and its offset committed (so the partition is not
-	// wedged); the record is dropped.
+	// deliveryExhausted: a finite retry budget of non-2xx rejections was used up
+	// without an ack. The record is skipped and its offset committed (so the
+	// partition is not wedged); the record is dropped. Transport errors and
+	// timeouts do not count toward this budget (see deliver).
 	deliveryExhausted
 	// deliveryAborted: the session context was cancelled (rebalance/shutdown)
 	// before a successful delivery. Do NOT commit, so the record is redelivered
@@ -233,10 +235,23 @@ const (
 
 // deliver invokes the function for a single record, retrying failed attempts per
 // the handler's deliveryConfig. It returns deliveredOK on a successful ack,
-// deliveryExhausted when a finite retry budget is used up, and deliveryAborted
-// when ctx is cancelled (rebalance/shutdown) before success.
+// deliveryExhausted when a finite retry budget of rejections is used up, and
+// deliveryAborted when ctx is cancelled (rebalance/shutdown) before success.
+//
+// The finite retry budget is spent only on non-2xx rejections -- cases where the
+// function received the record and actively rejected it ("poison"). Transport
+// errors and timeouts mean the function was unreachable or unresponsive (e.g. a
+// restart or crash), not that the record is bad, so they are retried indefinitely
+// and never exhaust the budget. This keeps at-least-once intact across an outage
+// longer than the budget, while still letting a bounded budget skip a genuinely
+// unprocessable record so it cannot wedge the partition forever.
 func (h *consumerGroupHandler) deliver(ctx context.Context, msg *sarama.ConsumerMessage, e event.Event) deliveryOutcome {
 	cfg := h.delivery
+	// rejections counts only non-2xx responses -- the attempts the finite budget
+	// actually pays for. A separate counter (rather than the total attempt index)
+	// ensures retries spent waiting out an unreachable function do not consume the
+	// poison-record budget.
+	rejections := 0
 	for attempt := 1; ; attempt++ {
 		_, err := h.adapter.Invoke(ctx, e)
 		if err == nil {
@@ -255,15 +270,22 @@ func (h *consumerGroupHandler) deliver(ctx context.Context, msg *sarama.Consumer
 			return deliveryAborted
 		}
 
-		// Stop once a finite retry budget is exhausted. A loud warning makes the
+		rejected := errors.Is(err, errFunctionRejected)
+		if rejected {
+			rejections++
+		}
+
+		// Stop once a finite budget of rejections is exhausted. Only rejections
+		// count: a non-2xx means the record itself is unprocessable, so after the
+		// budget we skip it to free the partition. A loud warning makes the
 		// dropped record visible; an observability metric is tracked separately
 		// (the runtime has no metrics subsystem yet).
-		if !cfg.unlimited() && attempt >= cfg.maxAttempts() {
+		if rejected && !cfg.unlimited() && rejections >= cfg.maxAttempts() {
 			log.Warn().Err(err).
 				Str("topic", msg.Topic).
 				Int32("partition", msg.Partition).
 				Int64("offset", msg.Offset).
-				Int("attempt", attempt).
+				Int("rejections", rejections).
 				Int("maxAttempts", cfg.maxAttempts()).
 				Msg("delivery to function failed and the retry budget is exhausted; skipping record and committing offset (record dropped)")
 			return deliveryExhausted
@@ -275,6 +297,7 @@ func (h *consumerGroupHandler) deliver(ctx context.Context, msg *sarama.Consumer
 			Int32("partition", msg.Partition).
 			Int64("offset", msg.Offset).
 			Int("attempt", attempt).
+			Bool("rejected", rejected).
 			Dur("retryIn", backoff).
 			Msg("delivery to function failed; will retry")
 

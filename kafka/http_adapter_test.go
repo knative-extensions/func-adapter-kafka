@@ -18,6 +18,7 @@ package kafka
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -64,7 +65,9 @@ func TestHTTPAdapter_2xxCommits(t *testing.T) {
 }
 
 // A non-2xx response is a failure: Invoke returns an error so the offset is NOT
-// committed and the record is redelivered.
+// committed and the record is redelivered. The error must classify as
+// errFunctionRejected (the function actively rejected the record) so the
+// consumer's finite retry budget is spent on it.
 func TestHTTPAdapter_Non2xxRetries(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -75,8 +78,12 @@ func TestHTTPAdapter_Non2xxRetries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newHTTPAdapter: %v", err)
 	}
-	if _, err := a.Invoke(context.Background(), newTestEvent(t)); err == nil {
+	_, err = a.Invoke(context.Background(), newTestEvent(t))
+	if err == nil {
 		t.Fatal("Invoke returned nil on 500; want error so the offset is not committed")
+	}
+	if !errors.Is(err, errFunctionRejected) {
+		t.Errorf("non-2xx error does not classify as errFunctionRejected: %v", err)
 	}
 }
 
@@ -99,11 +106,18 @@ func TestHTTPAdapter_TimeoutFails(t *testing.T) {
 	}
 
 	start := time.Now()
-	if _, err := a.Invoke(context.Background(), newTestEvent(t)); err == nil {
+	_, err = a.Invoke(context.Background(), newTestEvent(t))
+	if err == nil {
 		t.Fatal("Invoke returned nil for a non-responding function; want a timeout error")
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Errorf("Invoke took %v; the per-delivery timeout did not fire", elapsed)
+	}
+	// A timeout means the function was unresponsive, not that it rejected the
+	// record: it must NOT classify as errFunctionRejected, so the consumer retries
+	// it without spending the finite budget.
+	if errors.Is(err, errFunctionRejected) {
+		t.Errorf("timeout error wrongly classifies as errFunctionRejected: %v", err)
 	}
 }
 
@@ -159,8 +173,16 @@ func TestHTTPAdapter_ConnectionErrorRetries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newHTTPAdapter: %v", err)
 	}
-	if _, err := a.Invoke(context.Background(), newTestEvent(t)); err == nil {
+	_, err = a.Invoke(context.Background(), newTestEvent(t))
+	if err == nil {
 		t.Fatal("Invoke returned nil on connection failure; want error")
+	}
+	// A transport/connection error means the function was unreachable, not that it
+	// rejected the record: it must NOT classify as errFunctionRejected, so the
+	// consumer retries it without spending the finite budget (an outage must not
+	// drop good records).
+	if errors.Is(err, errFunctionRejected) {
+		t.Errorf("connection error wrongly classifies as errFunctionRejected: %v", err)
 	}
 }
 
